@@ -25,7 +25,7 @@
 
 require_once "vendor/autoload.php";
 
-$general_api_key = "c4c5fb4605c87dd9b";
+$general_api_key = "<REPLACE-WITH-YOUR-API-TOKEN>";
 
 // Check input mode: arguments or stdin
 if ($argc === 1) {
