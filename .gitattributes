@@ -1,0 +1,27 @@
+# Markdown files: Ensure consistent end-of-line handling for text files
+*.md text eol=lf
+
+# Shell scripts: Treat as text and normalize line endings
+*.sh text eol=lf
+
+# PHP files: Treat as text and normalize line endings
+*.php text eol=lf
+
+# Common image file formats: Mark as binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.svg binary
+
+# Other binary file formats (e.g., fonts, archives)
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.eot binary
+*.zip binary
+*.tar binary
+*.gz binary
+
+# Catch-all: Default to treating unknown files as binary
+* binary

@@ -1,0 +1,12 @@
+# Ignore all files in the top-level directory
+/*
+
+# Exclude specific files in the top-level directory from being ignored
+!.gitattributes
+!.gitignore
+!CODE_OF_CONDUCT.md
+!CONTRIBUTING.md
+!README.md
+
+# Allow everything in subdirectories
+!*/
