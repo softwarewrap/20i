@@ -18,6 +18,21 @@ This script creates an email forward for a specified email address within a doma
 ```
 This will forward all emails sent to `alice@example.com` to `bob@example.org`.
 
+#### Batch Forward Creation
+You can also create multiple email forwards in a single batch by providing input via `stdin`. Each line of input should contain the `<from_email> <to_email>` format.
+
+**Usage:**
+```bash
+cat forwards.txt | ./create-forward.php
+```
+
+**Example `forwards.txt` file:**
+```
+alice@example.com bob@example.org
+charlie@example.com dave@example.org
+```
+This will create forwards for both `alice@example.com` to `bob@example.org` and `charlie@example.com` to `dave@example.org`.
+
 ### `list-forwards.php`
 (Placeholder script)
 This script will list all existing email forwards for a specified domain.
