@@ -1,12 +1,11 @@
 #!/usr/bin/env php
 <?php
 /**
- * Plan the addition of one TXT DNS record to one or more domains.
+ * Add one TXT DNS record to one or more domains attached to 20i packages.
  *
- * This initial implementation provides the complete command-line interface,
- * validation, domain selection, package resolution, --all behavior, and
- * dry-run reporting. DNS retrieval and mutation will be enabled once the
- * supported 20i DNS endpoint for externally registered domains is confirmed.
+ * Existing records and post-write verification are checked directly against
+ * the authoritative StackDNS nameservers. DNS changes are submitted through
+ * the 20i package DNS endpoint.
  *
  * This file is part of a software project licensed under the
  * GNU General Public License v3.0.
@@ -37,12 +36,15 @@ require_once __DIR__ . '/../../lib/cli.php';
 require_once __DIR__ . '/../../lib/dns.php';
 require_once __DIR__ . '/../../lib/package.php';
 
+use function SoftwareWrap\TwentyI\Cli\confirm;
 use function SoftwareWrap\TwentyI\Cli\fail;
 use function SoftwareWrap\TwentyI\Cli\readLinesFromStdin;
 use function SoftwareWrap\TwentyI\Dns\buildAddTxtRecordPayload;
+use function SoftwareWrap\TwentyI\Dns\buildRecordFqdn;
 use function SoftwareWrap\TwentyI\Dns\requireSupportedRecordType;
 use function SoftwareWrap\TwentyI\Dns\requireValidRecordName;
 use function SoftwareWrap\TwentyI\Dns\requireValidTxtValue;
+use function SoftwareWrap\TwentyI\Dns\stackDnsTxtRecordExists;
 use function SoftwareWrap\TwentyI\findPackageByDomain;
 use function SoftwareWrap\TwentyI\getPackageDomains;
 use function SoftwareWrap\TwentyI\getPackageId;
@@ -51,9 +53,13 @@ use function SoftwareWrap\TwentyI\getPackages;
 use function SoftwareWrap\TwentyI\isValidDomain;
 use function SoftwareWrap\TwentyI\normalizeDomain;
 
+use const SoftwareWrap\TwentyI\Cli\EXIT_CANCELLED;
 use const SoftwareWrap\TwentyI\Cli\EXIT_ERROR;
 use const SoftwareWrap\TwentyI\Cli\EXIT_PARTIAL_FAILURE;
 use const SoftwareWrap\TwentyI\Cli\EXIT_SUCCESS;
+
+const CONFIRMATION_THRESHOLD = 10;
+const RECENT_SUBMISSION_WINDOW_SECONDS = 3600;
 
 /**
  * Display usage information.
@@ -65,13 +71,13 @@ function usage(int $exitCode = EXIT_SUCCESS): void
 
     fwrite($stream, <<<EOT
 Usage:
-  {$script} [--dry-run] [--yes] [--skip] <domain>
+  {$script} [--dry-run] [--yes] [--skip] [--force] <domain>
       --name <dns-name> --type TXT --value <string>
 
-  {$script} [--dry-run] [--yes] [--skip]
+  {$script} [--dry-run] [--yes] [--skip] [--force]
       --name <dns-name> --type TXT --value <string> < domains.txt
 
-  {$script} [--dry-run] [--yes] [--skip] --all <package-domain>
+  {$script} [--dry-run] [--yes] [--skip] [--force] --all <package-domain>
       --name <dns-name> --type TXT --value <string>
 
 Options:
@@ -83,10 +89,14 @@ Options:
              TXT record value.
   --all      Apply the record to every domain attached to the package
              identified by the positional <package-domain>.
-  --dry-run  Resolve and validate the request without changing DNS.
-  --yes, -y  Skip any future batch confirmation prompt.
-  --skip     When DNS record inspection is enabled, skip domains on which
-             the identical TXT record already exists.
+  --dry-run  Resolve packages, inspect authoritative DNS, and show what would
+             be done without changing DNS.
+  --yes, -y  Skip the confirmation prompt for a batch of 10 or more domains.
+  --skip     Skip domains on which the identical TXT record is already
+             published in authoritative DNS. Without --skip, any published
+             duplicate stops the run before changes begin.
+  --force    Ignore the local recent-submission safeguard. This does not
+             override a duplicate already visible in authoritative DNS.
   --help, -h Display this help text.
 
 Examples:
@@ -110,8 +120,11 @@ A single positional domain processes one domain. With no positional domain,
 domains are read from standard input. The --all option requires one positional
 domain that identifies a package.
 
-This version supports planning and dry-run validation only. DNS changes remain
-disabled until the supported 20i DNS endpoint is confirmed.
+Each eligible domain is submitted separately so that progress is reported
+continuously. Immediate authoritative verification is advisory because StackDNS
+publication may take 30 minutes or longer. Successful API submissions are
+recorded locally for 60 minutes to prevent accidental duplicate resubmission
+during that publication interval.
 
 EOT
     );
@@ -173,12 +186,297 @@ function validateDomains(array $domains): array
     return array_keys($unique);
 }
 
+/**
+ * Normalize a user-supplied owner name for one target domain.
+ *
+ * Accepted forms include @, an empty string, the zone domain, an in-zone
+ * fully qualified name, and an ordinary relative owner name. A trailing-dot
+ * fully qualified name must belong to the target zone. Wildcards are not
+ * supported by this initial TXT-only command.
+ */
+function normalizeRecordNameForDomain(
+    string $domain,
+    string $recordName
+): string {
+    $domain = normalizeDomain($domain);
+    $recordName = trim($recordName);
+
+    if ($recordName === '' || $recordName === '@') {
+        return '@';
+    }
+
+    if (strpos($recordName, '*') !== false) {
+        throw new InvalidArgumentException(
+            'Wildcard DNS owner names are not currently supported.'
+        );
+    }
+
+    $isAbsolute = substr($recordName, -1) === '.';
+    $normalizedName = strtolower(rtrim($recordName, '.'));
+
+    if ($normalizedName === $domain) {
+        return '@';
+    }
+
+    $zoneSuffix = '.' . $domain;
+
+    if (
+        strlen($normalizedName) > strlen($zoneSuffix)
+        && substr($normalizedName, -strlen($zoneSuffix)) === $zoneSuffix
+    ) {
+        $relativeName = substr(
+            $normalizedName,
+            0,
+            strlen($normalizedName) - strlen($zoneSuffix)
+        );
+
+        return requireValidRecordName($relativeName);
+    }
+
+    if ($isAbsolute) {
+        throw new InvalidArgumentException(
+            "DNS owner name '{$recordName}' is outside the target zone '{$domain}'."
+        );
+    }
+
+    return requireValidRecordName($normalizedName);
+}
+
+/**
+ * Ask the operator to confirm a large batch operation.
+ */
+function confirmBatch(int $count): bool
+{
+    return confirm(
+        "\nThis will submit one DNS record for {$count} domains and attempt immediate authoritative verification. Continue? [y/N] "
+    );
+}
+
+/**
+ * Return the path used for the local DNS submission journal.
+ */
+function getSubmissionJournalPath(): string
+{
+    $stateHome = getenv('XDG_STATE_HOME');
+
+    if (is_string($stateHome) && trim($stateHome) !== '') {
+        return rtrim($stateHome, DIRECTORY_SEPARATOR)
+            . DIRECTORY_SEPARATOR . '20i-cli'
+            . DIRECTORY_SEPARATOR . 'dns-submissions.json';
+    }
+
+    $home = getenv('HOME');
+
+    if (is_string($home) && trim($home) !== '') {
+        return rtrim($home, DIRECTORY_SEPARATOR)
+            . DIRECTORY_SEPARATOR . '.local'
+            . DIRECTORY_SEPARATOR . 'state'
+            . DIRECTORY_SEPARATOR . '20i-cli'
+            . DIRECTORY_SEPARATOR . 'dns-submissions.json';
+    }
+
+    $appData = getenv('LOCALAPPDATA') ?: getenv('APPDATA');
+
+    if (is_string($appData) && trim($appData) !== '') {
+        return rtrim($appData, DIRECTORY_SEPARATOR)
+            . DIRECTORY_SEPARATOR . '20i-cli'
+            . DIRECTORY_SEPARATOR . 'dns-submissions.json';
+    }
+
+    return rtrim(sys_get_temp_dir(), DIRECTORY_SEPARATOR)
+        . DIRECTORY_SEPARATOR . '20i-cli'
+        . DIRECTORY_SEPARATOR . 'dns-submissions.json';
+}
+
+/**
+ * Return the stable key used to identify an identical DNS submission.
+ */
+function buildSubmissionKey(
+    string $packageId,
+    string $domain,
+    string $recordName,
+    string $recordValue
+): string {
+    return hash(
+        'sha256',
+        implode("\n", [
+            $packageId,
+            normalizeDomain($domain),
+            buildRecordFqdn($domain, $recordName),
+            'TXT',
+            $recordValue,
+        ])
+    );
+}
+
+/**
+ * Read the local submission journal and discard expired entries.
+ *
+ * @return array<string,array<string,mixed>>
+ */
+function readSubmissionJournal(string $path): array
+{
+    if (!is_file($path)) {
+        return [];
+    }
+
+    $contents = file_get_contents($path);
+
+    if ($contents === false) {
+        throw new RuntimeException("Unable to read DNS submission journal '{$path}'.");
+    }
+
+    if (trim($contents) === '') {
+        return [];
+    }
+
+    $decoded = json_decode($contents, true, 512, JSON_THROW_ON_ERROR);
+
+    if (!is_array($decoded)) {
+        throw new RuntimeException("DNS submission journal '{$path}' is invalid.");
+    }
+
+    $cutoff = time() - RECENT_SUBMISSION_WINDOW_SECONDS;
+    $active = [];
+
+    foreach ($decoded as $key => $entry) {
+        if (!is_string($key) || !is_array($entry)) {
+            continue;
+        }
+
+        $submittedAt = $entry['submittedAt'] ?? null;
+
+        if (is_int($submittedAt) && $submittedAt >= $cutoff) {
+            $active[$key] = $entry;
+        }
+    }
+
+    return $active;
+}
+
+/**
+ * Return a recent matching submission, or null when none exists.
+ *
+ * @return array<string,mixed>|null
+ */
+function findRecentSubmission(
+    array $journal,
+    string $packageId,
+    string $domain,
+    string $recordName,
+    string $recordValue
+): ?array {
+    $key = buildSubmissionKey(
+        $packageId,
+        $domain,
+        $recordName,
+        $recordValue
+    );
+
+    $entry = $journal[$key] ?? null;
+
+    return is_array($entry) ? $entry : null;
+}
+
+/**
+ * Persist a successful API submission atomically.
+ */
+function recordSubmission(
+    string $path,
+    array &$journal,
+    string $packageId,
+    string $domain,
+    string $recordName,
+    string $recordValue
+): void {
+    $directory = dirname($path);
+
+    if (!is_dir($directory) && !mkdir($directory, 0700, true) && !is_dir($directory)) {
+        throw new RuntimeException(
+            "Unable to create DNS submission journal directory '{$directory}'."
+        );
+    }
+
+    $key = buildSubmissionKey(
+        $packageId,
+        $domain,
+        $recordName,
+        $recordValue
+    );
+
+    $journal[$key] = [
+        'packageId' => $packageId,
+        'domain' => normalizeDomain($domain),
+        'fqdn' => buildRecordFqdn($domain, $recordName),
+        'type' => 'TXT',
+        'value' => $recordValue,
+        'submittedAt' => time(),
+        'submittedAtIso8601' => gmdate('c'),
+    ];
+
+    $temporaryPath = $path . '.tmp-' . getmypid();
+    $json = json_encode(
+        $journal,
+        JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR
+    ) . "\n";
+
+    if (file_put_contents($temporaryPath, $json, LOCK_EX) === false) {
+        throw new RuntimeException(
+            "Unable to write DNS submission journal '{$temporaryPath}'."
+        );
+    }
+
+    @chmod($temporaryPath, 0600);
+
+    if (!rename($temporaryPath, $path)) {
+        @unlink($temporaryPath);
+        throw new RuntimeException(
+            "Unable to replace DNS submission journal '{$path}'."
+        );
+    }
+}
+
+/**
+ * Format the age of a recent submission for operator output.
+ */
+function formatSubmissionAge(int $submittedAt): string
+{
+    $seconds = max(0, time() - $submittedAt);
+
+    if ($seconds < 60) {
+        return $seconds . ' second' . ($seconds === 1 ? '' : 's');
+    }
+
+    $minutes = intdiv($seconds, 60);
+
+    return $minutes . ' minute' . ($minutes === 1 ? '' : 's');
+}
+
+/**
+ * Report duplicate records skipped during preflight.
+ *
+ * @param array<int,string> $skippedDomains
+ */
+function reportSkippedDomains(array $skippedDomains): void
+{
+    if ($skippedDomains === []) {
+        return;
+    }
+
+    echo "\nSkipped existing records (" . count($skippedDomains) . "):\n";
+
+    foreach ($skippedDomains as $domain) {
+        echo "  {$domain}\n";
+    }
+}
+
 /*
  * Parse options and positional arguments.
  */
 $dryRun = false;
 $assumeYes = false;
 $skipExisting = false;
+$forceRecentSubmission = false;
 $allDomains = false;
 
 $recordName = null;
@@ -208,38 +506,28 @@ for ($index = 1; $index < $argc; $index++) {
         continue;
     }
 
+    if ($argument === '--force') {
+        $forceRecentSubmission = true;
+        continue;
+    }
+
     if ($argument === '--all') {
         $allDomains = true;
         continue;
     }
 
     if ($argument === '--name') {
-        $recordName = requireOptionValue(
-            '--name',
-            $index,
-            $argc,
-            $argv
-        );
+        $recordName = requireOptionValue('--name', $index, $argc, $argv);
         continue;
     }
 
     if ($argument === '--type') {
-        $recordType = requireOptionValue(
-            '--type',
-            $index,
-            $argc,
-            $argv
-        );
+        $recordType = requireOptionValue('--type', $index, $argc, $argv);
         continue;
     }
 
     if ($argument === '--value') {
-        $recordValue = requireOptionValue(
-            '--value',
-            $index,
-            $argc,
-            $argv
-        );
+        $recordValue = requireOptionValue('--value', $index, $argc, $argv);
         continue;
     }
 
@@ -263,27 +551,21 @@ if ($recordValue === null) {
 }
 
 try {
-    $recordName = requireValidRecordName($recordName);
     $recordType = requireSupportedRecordType($recordType);
     $recordValue = requireValidTxtValue($recordValue);
 
-    /*
-     * Construct the payload now so validation covers the exact structure
-     * that the eventual API mutation will use.
-     */
-    $payload = buildAddTxtRecordPayload(
-        $recordName,
-        $recordValue
-    );
+    if (strpos($recordName, '*') !== false) {
+        throw new InvalidArgumentException(
+            'Wildcard DNS owner names are not currently supported.'
+        );
+    }
 } catch (Throwable $exception) {
     fail($exception->getMessage());
 }
 
 if ($allDomains) {
     if (count($arguments) !== 1) {
-        fail(
-            'The --all option requires exactly one positional package domain.'
-        );
+        fail('The --all option requires exactly one positional package domain.');
     }
 
     $selectorDomain = normalizeDomain($arguments[0]);
@@ -295,14 +577,10 @@ if ($allDomains) {
     $requestedDomains = [];
 } elseif (count($arguments) === 1) {
     $selectorDomain = null;
-    $requestedDomains = validateDomains([
-        normalizeDomain($arguments[0]),
-    ]);
+    $requestedDomains = validateDomains([$arguments[0]]);
 } elseif (count($arguments) === 0) {
     $selectorDomain = null;
-    $requestedDomains = validateDomains(
-        readDomainsFromStdin()
-    );
+    $requestedDomains = validateDomains(readDomainsFromStdin());
 
     if ($requestedDomains === []) {
         fail('No domains were provided.');
@@ -314,14 +592,10 @@ if ($allDomains) {
 try {
     $servicesApi = new \TwentyI\API\Services($api_key);
     $packages = getPackages($servicesApi);
-
     $targets = [];
 
     if ($allDomains) {
-        $package = findPackageByDomain(
-            $packages,
-            $selectorDomain
-        );
+        $package = findPackageByDomain($packages, $selectorDomain);
 
         if ($package === null) {
             fail("No package contains '{$selectorDomain}'.");
@@ -332,9 +606,7 @@ try {
         $packageDomains = getPackageDomains($package);
 
         if ($packageDomains === []) {
-            fail(
-                "Package '{$packageId}' does not contain any usable domains."
-            );
+            fail("Package '{$packageId}' does not contain any usable domains.");
         }
 
         foreach ($packageDomains as $domain) {
@@ -342,29 +614,26 @@ try {
                 'domain' => $domain,
                 'packageId' => $packageId,
                 'packageSelector' => $packageSelector,
+                'recordName' => normalizeRecordNameForDomain(
+                    $domain,
+                    $recordName
+                ),
             ];
         }
     } else {
         foreach ($requestedDomains as $domain) {
-            $package = findPackageByDomain(
-                $packages,
-                $domain
-            );
-
-            if ($package === null) {
-                $targets[] = [
-                    'domain' => $domain,
-                    'packageId' => null,
-                    'packageSelector' => null,
-                ];
-
-                continue;
-            }
+            $package = findPackageByDomain($packages, $domain);
 
             $targets[] = [
                 'domain' => $domain,
-                'packageId' => getPackageId($package),
-                'packageSelector' => getPackageSelector($package),
+                'packageId' => $package === null ? null : getPackageId($package),
+                'packageSelector' => $package === null
+                    ? null
+                    : getPackageSelector($package),
+                'recordName' => normalizeRecordNameForDomain(
+                    $domain,
+                    $recordName
+                ),
             ];
         }
     }
@@ -376,68 +645,302 @@ try {
     echo "\nRequested mode: "
         . ($allDomains ? 'all domains in package' : 'explicit domains')
         . "\n";
-    echo "Skip identical records: "
-        . ($skipExisting ? 'yes' : 'no')
-        . "\n";
-    echo "Confirmation bypass: "
-        . ($assumeYes ? 'yes' : 'no')
-        . "\n";
+    echo "Skip published identical records: "
+        . ($skipExisting ? 'yes' : 'no') . "\n";
+    echo "Ignore recent-submission safeguard: "
+        . ($forceRecentSubmission ? 'yes' : 'no') . "\n";
     echo "Domains resolved: " . count($targets) . "\n";
 
-    $resolvableCount = 0;
-    $unresolvedCount = 0;
+    $journalPath = getSubmissionJournalPath();
+    $submissionJournal = readSubmissionJournal($journalPath);
 
-    echo "\nPlanning results:\n";
+    $eligibleTargets = [];
+    $duplicateDomains = [];
+    $recentSubmissionDomains = [];
+    $unresolvedDomains = [];
+    $inspectionFailures = [];
+    $totalTargets = count($targets);
+
+    echo "\nPreflight inspection:\n";
 
     foreach ($targets as $offset => $target) {
         $position = $offset + 1;
-        $total = count($targets);
         $domain = $target['domain'];
 
+        echo "[{$position}/{$totalTargets}] {$domain} ... ";
+        fflush(STDOUT);
+
         if ($target['packageId'] === null) {
-            echo "[{$position}/{$total}] {$domain} ... "
-                . "ERROR: not attached to any visible package\n";
-            $unresolvedCount++;
+            echo "ERROR: not attached to any visible package\n";
+            $unresolvedDomains[$domain] = 'not attached to any visible package';
             continue;
         }
 
-        echo "[{$position}/{$total}] {$domain} ... "
-            . "WOULD ADD {$recordType} {$recordName} "
-            . "to package {$target['packageId']}"
-            . " ({$target['packageSelector']})\n";
+        try {
+            $targetRecordName = $target['recordName'];
 
-        $resolvableCount++;
+            if (
+                stackDnsTxtRecordExists(
+                    $domain,
+                    $targetRecordName,
+                    $recordValue
+                )
+            ) {
+                echo "EXISTS\n";
+                $duplicateDomains[] = $domain;
+                continue;
+            }
+
+            $recentSubmission = findRecentSubmission(
+                $submissionJournal,
+                (string) $target['packageId'],
+                $domain,
+                $targetRecordName,
+                $recordValue
+            );
+
+            if (
+                $recentSubmission !== null
+                && !$forceRecentSubmission
+            ) {
+                $age = formatSubmissionAge(
+                    (int) ($recentSubmission['submittedAt'] ?? time())
+                );
+                echo "RECENTLY SUBMITTED ({$age} ago)\n";
+                $recentSubmissionDomains[$domain] = $recentSubmission;
+                continue;
+            }
+
+            echo "READY\n";
+            $eligibleTargets[] = $target;
+        } catch (Throwable $inspectionException) {
+            echo "ERROR: {$inspectionException->getMessage()}\n";
+            $inspectionFailures[$domain] = $inspectionException->getMessage();
+        }
     }
 
-    echo "\nPlanning complete.\n";
-    echo "  Eligible domains: {$resolvableCount}\n";
-    echo "  Unresolved domains: {$unresolvedCount}\n";
+    echo "\nPreflight complete.\n";
+    echo "  Ready to add: " . count($eligibleTargets) . "\n";
+    echo "  Published existing: " . count($duplicateDomains) . "\n";
+    echo "  Recently submitted: " . count($recentSubmissionDomains) . "\n";
+    echo "  Unresolved: " . count($unresolvedDomains) . "\n";
+    echo "  Inspection failures: " . count($inspectionFailures) . "\n";
 
-    if (!$dryRun) {
+    if ($duplicateDomains !== [] && !$skipExisting) {
         fwrite(
             STDERR,
-            "\nError: DNS mutation is not yet enabled because the supported "
-            . "20i DNS endpoint for externally registered domains remains "
-            . "unconfirmed. No DNS changes were made.\n"
+            "\nIdentical TXT records already exist ("
+            . count($duplicateDomains)
+            . "):\n"
         );
 
-        exit(EXIT_ERROR);
+        foreach ($duplicateDomains as $domain) {
+            fwrite(STDERR, "  {$domain}\n");
+        }
+
+        fail(
+            'No changes were made because at least one identical record '
+            . 'already exists. Rerun with --skip to ignore existing records.'
+        );
     }
 
-    echo "\nDry run complete. No DNS changes were made.\n";
+    if ($eligibleTargets === []) {
+        echo "\nNo DNS records need to be added.\n";
+        reportSkippedDomains($duplicateDomains);
 
-    /*
-     * The payload variable is deliberately retained even though it is not
-     * submitted yet. It proves that the planned request has already passed
-     * DNS validation and payload construction.
-     */
-    unset($payload);
+        if ($recentSubmissionDomains !== []) {
+            echo "\nProtected recent submissions ("
+                . count($recentSubmissionDomains)
+                . "):\n";
+            foreach ($recentSubmissionDomains as $domain => $entry) {
+                $age = formatSubmissionAge((int) ($entry['submittedAt'] ?? time()));
+                echo "  {$domain} -> accepted {$age} ago; publication pending\n";
+            }
+        }
 
-    exit(
-        $unresolvedCount === 0
-            ? EXIT_SUCCESS
-            : EXIT_PARTIAL_FAILURE
-    );
+        exit(
+            $unresolvedDomains === [] && $inspectionFailures === []
+                ? EXIT_SUCCESS
+                : EXIT_PARTIAL_FAILURE
+        );
+    }
+
+    if ($dryRun) {
+        echo "\nDry-run results:\n";
+        $total = count($eligibleTargets);
+
+        foreach ($eligibleTargets as $offset => $target) {
+            $position = $offset + 1;
+            echo "[{$position}/{$total}] {$target['domain']} ... WOULD ADD\n";
+        }
+
+        echo "\nDry run complete. No DNS changes were made.\n";
+        reportSkippedDomains($duplicateDomains);
+
+        if ($recentSubmissionDomains !== []) {
+            echo "\nProtected recent submissions ("
+                . count($recentSubmissionDomains)
+                . "):\n";
+            foreach ($recentSubmissionDomains as $domain => $entry) {
+                $age = formatSubmissionAge((int) ($entry['submittedAt'] ?? time()));
+                echo "  {$domain} -> accepted {$age} ago; publication pending\n";
+            }
+        }
+
+        exit(
+            $unresolvedDomains === [] && $inspectionFailures === []
+                ? EXIT_SUCCESS
+                : EXIT_PARTIAL_FAILURE
+        );
+    }
+
+    if (
+        count($eligibleTargets) >= CONFIRMATION_THRESHOLD
+        && !$assumeYes
+        && !confirmBatch(count($eligibleTargets))
+    ) {
+        fwrite(STDERR, "\nOperation cancelled. No changes were made.\n");
+        exit(EXIT_CANCELLED);
+    }
+
+    $acceptedCount = 0;
+    $verifiedCount = 0;
+    $pendingDomains = [];
+    $failedDomains = [];
+    $journalWarnings = [];
+    $total = count($eligibleTargets);
+
+    echo "\nProcessing domains:\n";
+
+    foreach ($eligibleTargets as $offset => $target) {
+        $position = $offset + 1;
+        $domain = $target['domain'];
+        $packageId = (string) $target['packageId'];
+        $targetRecordName = $target['recordName'];
+        $payload = buildAddTxtRecordPayload(
+            $targetRecordName,
+            $recordValue
+        );
+
+        echo "[{$position}/{$total}] {$domain} ... ";
+        fflush(STDOUT);
+
+        try {
+            $servicesApi->postWithFields(
+                '/package/' . rawurlencode($packageId)
+                . '/dns/' . rawurlencode($domain),
+                $payload
+            );
+        } catch (Throwable $domainException) {
+            echo "ERROR: {$domainException->getMessage()}\n";
+            $failedDomains[$domain] = $domainException->getMessage();
+            continue;
+        }
+
+        $acceptedCount++;
+
+        try {
+            recordSubmission(
+                $journalPath,
+                $submissionJournal,
+                $packageId,
+                $domain,
+                $targetRecordName,
+                $recordValue
+            );
+        } catch (Throwable $journalException) {
+            $journalWarnings[$domain] = $journalException->getMessage();
+        }
+
+        try {
+            $verified = stackDnsTxtRecordExists(
+                $domain,
+                $targetRecordName,
+                $recordValue
+            );
+        } catch (Throwable $verificationException) {
+            $verified = false;
+            $pendingDomains[$domain] =
+                'The 20i API accepted the TXT record, but immediate '
+                . 'authoritative verification could not be completed: '
+                . $verificationException->getMessage()
+                . ' Allow at least 30 minutes before checking again or '
+                . 'submitting the same record.';
+        }
+
+        if ($verified) {
+            echo "ACCEPTED; VERIFIED\n";
+            $verifiedCount++;
+        } else {
+            echo "ACCEPTED; PUBLICATION PENDING\n";
+
+            if (!isset($pendingDomains[$domain])) {
+                $pendingDomains[$domain] =
+                    'The 20i API accepted the TXT record, but it is not yet '
+                    . 'visible through authoritative StackDNS. Allow at least '
+                    . '30 minutes before checking again or submitting the same record.';
+            }
+        }
+    }
+
+    $failureCount = count($failedDomains)
+        + count($unresolvedDomains)
+        + count($inspectionFailures);
+
+    echo "\nProcessing complete.\n";
+    echo "  API accepted: {$acceptedCount}\n";
+    echo "  Published existing skipped: " . count($duplicateDomains) . "\n";
+    echo "  Recent submissions protected: "
+        . count($recentSubmissionDomains) . "\n";
+    echo "  API/resolution failures: {$failureCount}\n";
+
+    echo "\nVerification status.\n";
+    echo "  Verified immediately: {$verifiedCount}\n";
+    echo "  Pending publication: " . count($pendingDomains) . "\n";
+
+    $allFailures = $unresolvedDomains + $inspectionFailures + $failedDomains;
+
+    if ($allFailures !== []) {
+        echo "\nFailed domains:\n";
+
+        foreach ($allFailures as $domain => $message) {
+            echo "  {$domain} -> {$message}\n";
+        }
+    }
+
+    if ($pendingDomains !== []) {
+        echo "\nPending authoritative publication:\n";
+
+        foreach ($pendingDomains as $domain => $message) {
+            echo "  {$domain} -> {$message}\n";
+        }
+    }
+
+    if ($journalWarnings !== []) {
+        echo "\nLocal submission journal warnings:\n";
+
+        foreach ($journalWarnings as $domain => $message) {
+            echo "  {$domain} -> {$message}\n";
+        }
+
+        echo "  Do not rerun these submissions until authoritative DNS shows them.\n";
+    }
+
+    reportSkippedDomains($duplicateDomains);
+
+    if ($recentSubmissionDomains !== []) {
+        echo "\nProtected recent submissions ("
+            . count($recentSubmissionDomains)
+            . "):\n";
+
+        foreach ($recentSubmissionDomains as $domain => $entry) {
+            $age = formatSubmissionAge((int) ($entry['submittedAt'] ?? time()));
+            echo "  {$domain} -> accepted {$age} ago; publication pending\n";
+        }
+    }
+
+
+    exit($failureCount === 0 ? EXIT_SUCCESS : EXIT_PARTIAL_FAILURE);
 } catch (Throwable $exception) {
     fail($exception->getMessage());
 }
