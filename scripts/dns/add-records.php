@@ -806,6 +806,7 @@ try {
     $acceptedCount = 0;
     $verifiedCount = 0;
     $pendingDomains = [];
+    $verificationWarnings = [];
     $failedDomains = [];
     $journalWarnings = [];
     $total = count($eligibleTargets);
@@ -860,12 +861,8 @@ try {
             );
         } catch (Throwable $verificationException) {
             $verified = false;
-            $pendingDomains[$domain] =
-                'The 20i API accepted the TXT record, but immediate '
-                . 'authoritative verification could not be completed: '
-                . $verificationException->getMessage()
-                . ' Allow at least 30 minutes before checking again or '
-                . 'submitting the same record.';
+            $verificationWarnings[$domain] =
+                $verificationException->getMessage();
         }
 
         if ($verified) {
@@ -873,13 +870,7 @@ try {
             $verifiedCount++;
         } else {
             echo "ACCEPTED; PUBLICATION PENDING\n";
-
-            if (!isset($pendingDomains[$domain])) {
-                $pendingDomains[$domain] =
-                    'The 20i API accepted the TXT record, but it is not yet '
-                    . 'visible through authoritative StackDNS. Allow at least '
-                    . '30 minutes before checking again or submitting the same record.';
-            }
+            $pendingDomains[] = $domain;
         }
     }
 
@@ -894,7 +885,7 @@ try {
         . count($recentSubmissionDomains) . "\n";
     echo "  API/resolution failures: {$failureCount}\n";
 
-    echo "\nVerification status.\n";
+    echo "\nVerification status:\n";
     echo "  Verified immediately: {$verifiedCount}\n";
     echo "  Pending publication: " . count($pendingDomains) . "\n";
 
@@ -909,9 +900,22 @@ try {
     }
 
     if ($pendingDomains !== []) {
-        echo "\nPending authoritative publication:\n";
+        echo "\nPending authoritative publication ("
+            . count($pendingDomains) . "):\n";
 
-        foreach ($pendingDomains as $domain => $message) {
+        foreach ($pendingDomains as $domain) {
+            echo "  {$domain}\n";
+        }
+
+        echo "\nThe 20i API accepted all pending records. "
+            . "StackDNS publication may take 30 minutes or longer.\n";
+        echo "Do not resubmit these records during that interval.\n";
+    }
+
+    if ($verificationWarnings !== []) {
+        echo "\nAuthoritative verification warnings:\n";
+
+        foreach ($verificationWarnings as $domain => $message) {
             echo "  {$domain} -> {$message}\n";
         }
     }
