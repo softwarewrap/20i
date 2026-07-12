@@ -28,21 +28,27 @@
 declare(strict_types=1);
 
 require_once __DIR__ . '/../../lib/bootstrap.php';
+require_once __DIR__ . '/../../lib/cli.php';
 require_once __DIR__ . '/../../lib/package.php';
 
+use function SoftwareWrap\TwentyI\Cli\confirm;
+use function SoftwareWrap\TwentyI\Cli\fail;
+use function SoftwareWrap\TwentyI\Cli\readLinesFromStdin;
 use function SoftwareWrap\TwentyI\findPackageByDomain;
+use function SoftwareWrap\TwentyI\getPackageId;
+use function SoftwareWrap\TwentyI\getPackageSelector;
 use function SoftwareWrap\TwentyI\getPackages;
 use function SoftwareWrap\TwentyI\isValidDomain;
 use function SoftwareWrap\TwentyI\normalizeDomain;
 
+use const SoftwareWrap\TwentyI\Cli\EXIT_CANCELLED;
+use const SoftwareWrap\TwentyI\Cli\EXIT_ERROR;
+use const SoftwareWrap\TwentyI\Cli\EXIT_PARTIAL_FAILURE;
+use const SoftwareWrap\TwentyI\Cli\EXIT_SUCCESS;
+
 const CONFIRMATION_THRESHOLD = 10;
 const VERIFICATION_ATTEMPTS = 3;
 const VERIFICATION_DELAY_SECONDS = 1;
-
-const EXIT_SUCCESS = 0;
-const EXIT_ERROR = 1;
-const EXIT_CANCELLED = 2;
-const EXIT_PARTIAL_FAILURE = 3;
 
 /**
  * Display usage information.
@@ -84,34 +90,16 @@ EOT
 }
 
 /**
- * Write an error message and terminate.
- */
-function fail(string $message, int $exitCode = EXIT_ERROR): void
-{
-    fwrite(STDERR, "Error: {$message}\n");
-    exit($exitCode);
-}
-
-/**
- * Read domain names from standard input.
+ * Read and normalize domain names from standard input.
  *
  * @return array<int,string>
  */
 function readDomainsFromStdin(): array
 {
-    $domains = [];
-
-    while (($line = fgets(STDIN)) !== false) {
-        $line = trim($line);
-
-        if ($line === '' || strpos($line, '#') === 0) {
-            continue;
-        }
-
-        $domains[] = normalizeDomain($line);
-    }
-
-    return $domains;
+    return array_map(
+        'SoftwareWrap\\TwentyI\\normalizeDomain',
+        readLinesFromStdin()
+    );
 }
 
 /**
@@ -119,67 +107,9 @@ function readDomainsFromStdin(): array
  */
 function confirmBatch(int $count): bool
 {
-    $tty = fopen('/dev/tty', 'r+');
-
-    if ($tty === false) {
-        throw new RuntimeException(
-            'Unable to open /dev/tty for confirmation. '
-            . 'Rerun with --yes to bypass the prompt.'
-        );
-    }
-
-    fwrite(
-        $tty,
+    return confirm(
         "\nThis will add and verify {$count} domains individually. Continue? [y/N] "
     );
-
-    $response = fgets($tty);
-    fclose($tty);
-
-    if ($response === false) {
-        return false;
-    }
-
-    $response = strtolower(trim($response));
-
-    return $response === 'y' || $response === 'yes';
-}
-
-/**
- * Return a usable package ID or throw an exception.
- *
- * @param array<string,mixed> $package
- */
-function getPackageId(array $package): string
-{
-    if (
-        !isset($package['id'])
-        || (!is_int($package['id']) && !is_string($package['id']))
-    ) {
-        throw new RuntimeException(
-            'The matching package does not contain a usable package ID.'
-        );
-    }
-
-    return (string) $package['id'];
-}
-
-/**
- * Return a helpful selector for a package.
- *
- * @param array<string,mixed> $package
- */
-function getPackageSelector(array $package): string
-{
-    if (isset($package['names']) && is_array($package['names'])) {
-        foreach ($package['names'] as $name) {
-            if (is_string($name) && $name !== '') {
-                return $name;
-            }
-        }
-    }
-
-    return 'unknown';
 }
 
 /**

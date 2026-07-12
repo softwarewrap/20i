@@ -1,6 +1,6 @@
 <?php
 /**
- * Shared helpers for locating 20i hosting packages by domain name.
+ * Shared helpers for locating and inspecting 20i hosting packages.
  *
  * This file is part of a software project licensed under the
  * GNU General Public License v3.0.
@@ -134,4 +134,73 @@ function getPackageByDomain(Services $servicesApi, string $domain): ?array
         getPackages($servicesApi),
         $domain
     );
+}
+
+/**
+ * Return a usable package ID.
+ *
+ * @param array<string,mixed> $package
+ */
+function getPackageId(array $package): string
+{
+    if (
+        !isset($package['id'])
+        || (!is_int($package['id']) && !is_string($package['id']))
+    ) {
+        throw new RuntimeException(
+            'The package does not contain a usable package ID.'
+        );
+    }
+
+    return (string) $package['id'];
+}
+
+/**
+ * Return a helpful domain selector for a package.
+ *
+ * The first valid domain name in the package's names array is returned.
+ * If the package contains no usable names, "unknown" is returned.
+ *
+ * @param array<string,mixed> $package
+ */
+function getPackageSelector(array $package): string
+{
+    foreach (getPackageDomains($package) as $domain) {
+        return $domain;
+    }
+
+    return 'unknown';
+}
+
+/**
+ * Return the normalized domain names attached to a package.
+ *
+ * Duplicate names are removed while preserving their original order.
+ *
+ * @param array<string,mixed> $package
+ * @return array<int,string>
+ */
+function getPackageDomains(array $package): array
+{
+    if (!isset($package['names']) || !is_array($package['names'])) {
+        return [];
+    }
+
+    $domains = [];
+
+    foreach ($package['names'] as $name) {
+        if (!is_string($name)) {
+            continue;
+        }
+
+        $domain = normalizeDomain($name);
+
+        if ($domain === '') {
+            continue;
+        }
+
+        $domains[$domain] = true;
+    }
+
+    return array_keys($domains);
 }

@@ -1,5 +1,6 @@
 # Ignore all files in the top-level directory
 /*
+/tmp/
 
 # Exclude specific files in the top-level directory from being ignored
 !.gitattributes
