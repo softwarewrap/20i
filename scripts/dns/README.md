@@ -1,4 +1,4 @@
-# DNS Automation Scripts
+# `scripts/dns`
 
 The `scripts/dns/` directory contains command-line tools for managing DNS records on domains attached to 20i hosting packages.
 
